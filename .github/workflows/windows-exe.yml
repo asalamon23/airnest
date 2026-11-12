@@ -1,1 +1,22 @@
 
+name: Build Windows EXE
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build standalone executable
+        run: |
+          python -m pip install --upgrade pyinstaller
+          python -m PyInstaller --onefile --name Dantherm-HCV400 --hidden-import hcv400 launcher.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dantherm-HCV400-Windows
+          path: dist/Dantherm-HCV400.exe
