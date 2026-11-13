@@ -1,9 +1,9 @@
-import argparse, csv, datetime, json, os, socket, struct, threading, time, secrets, tempfile, logging, sys, traceback
+import argparse, csv, datetime, json, os, socket, struct, threading, time, secrets, tempfile, logging, sys, traceback, ipaddress, concurrent.futures
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 p=argparse.ArgumentParser()
-p.add_argument('--device',default='192.168.1.142');p.add_argument('--port',type=int,default=502)
+p.add_argument('--device',default='auto');p.add_argument('--port',type=int,default=502)
 p.add_argument('--unit',type=int,default=1);p.add_argument('--web-port',type=int,default=8088)
 p.add_argument('--interval',type=int,default=15);p.add_argument('--output',default='hcv400_history.csv')
 a=p.parse_args()
@@ -24,6 +24,77 @@ FIELDS={'supply_rpm':(100,'float','RPM'),'extract_rpm':(102,'float','RPM'),
 'filter_days':(554,'uint','days'),'filter_period':(556,'uint','days'),'alarm_status':(516,'uint','raw'),'runtime_hours':(624,'uint','hours'),'preheater_duty':(160,'uint','raw'),'air_quality':(430,'uint','raw'),'co2':(574,'uint','ppm')}
 state={'status':'Starting','device':a.device,'last_update':None,'values':{},'errors':{},'last_command':None}
 lock=threading.RLock(); bus_lock=threading.Lock(); csrf=secrets.token_urlsafe(32)
+DEVICE_PATH=os.path.join(DATA_DIR,'device.json')
+discovery={'running':False,'candidates':[],'last_scan':None,'error':None}
+device_confirmed=False
+try:
+    with open(DEVICE_PATH,encoding='utf-8') as f:
+        saved_device=json.load(f).get('ip')
+    if saved_device and ipaddress.ip_address(saved_device).is_private and a.device=='auto':a.device=saved_device
+except (OSError,ValueError,TypeError,AttributeError):pass
+state['device']=a.device
+# A register signature is a compatibility check, NOT a cryptographic device identity.
+def probe_host(ip,timeout=.65):
+    try:
+        with socket.create_connection((ip,a.port),timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            tx=42;packet=struct.pack('>HHHB',tx,0,6,a.unit)+struct.pack('>BHH',3,132,2)
+            sock.sendall(packet)
+            def read_exact(n):
+                buf=b''
+                while len(buf)<n:
+                    part=sock.recv(n-len(buf))
+                    if not part:raise ConnectionError('Closed')
+                    buf+=part
+                return buf
+            header=read_exact(7);tid,proto,length,uid=struct.unpack('>HHHB',header)
+            if (tid,proto,uid)!=(tx,0,a.unit) or length!=7:return False
+            payload=read_exact(length-1)
+            if payload[:2]!=b'\x03\x04':return False
+            outdoor=struct.unpack('>f',payload[4:6]+payload[2:4])[0]
+            return -45<=outdoor<=60
+    except (OSError,ValueError,struct.error):return False
+
+def local_subnet():
+    # Use the active IPv4 route. Avoid scanning arbitrary networks or VPN ranges.
+    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+        sock.connect(('1.1.1.1',80))
+        ip=ipaddress.ip_address(sock.getsockname()[0])
+    if not ip.is_private or ip.is_loopback:return None
+    return ipaddress.ip_network(str(ip)+'/24',strict=False)
+
+def scan_worker():
+    with lock:discovery.update(running=True,error=None,candidates=[])
+    try:
+        net=local_subnet()
+        if net is None:raise ValueError('No private IPv4 LAN detected')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
+            results=list(pool.map(lambda ip:(str(ip),probe_host(str(ip))),net.hosts()))
+        matches=[{'ip':ip,'description':'Compatible Modbus register response (identity unverified)'} for ip,ok in results if ok]
+        with lock:discovery.update(candidates=matches,last_scan=datetime.datetime.now(datetime.timezone.utc).isoformat())
+    except Exception as e:
+        logging.exception('Discovery failed')
+        with lock:discovery['error']=str(e)
+    finally:
+        with lock:discovery['running']=False
+
+def select_device(ip):
+    global device_confirmed
+    with lock:
+        if ip not in [item['ip'] for item in discovery['candidates']]:raise ValueError('Scan and select a discovered device')
+        # Pause automation after changing device, until operator enables it again.
+        config['enabled']=False;config['night_enabled']=False;config['vacation_enabled']=False;config['sleep_until']=None
+        save_config(config)
+        a.device=ip;state['device']=ip;state['status']='Reconnecting';state['values']={};state['last_update']=None
+        device_confirmed=True
+    fd,tmp=tempfile.mkstemp(dir=DATA_DIR,prefix='device-',suffix='.tmp')
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as f:json.dump({'ip':ip},f)
+        os.replace(tmp,DEVICE_PATH)
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+    logging.info('User selected LAN device %s',ip)
+
 CONFIG_PATH=os.path.join(DATA_DIR,'hcv400_automation.json')
 DEFAULT_CONFIG={'enabled':False,'schedule':[{'time':'07:00','level':2},{'time':'22:00','level':1}],
                 'humidity_enabled':False,'humidity_below':42,'humidity_release':45,
@@ -79,6 +150,7 @@ if os.path.exists(CONFIG_PATH):
         config=dict(DEFAULT_CONFIG);config['schedule']=[dict(x) for x in DEFAULT_CONFIG['schedule']]
 
 def set_fan(level, source):
+    if not device_confirmed:raise ValueError('Confirm the device in Network Settings before sending commands')
     # Serialize reads/writes as well as manual/automatic decisions.
     with command_lock:
         before=read32(324)
@@ -103,6 +175,9 @@ def automation_step():
         cfg={**config,'schedule':[dict(x) for x in config['schedule']]}
         snapshot=dict(state['values']);stamp=state['last_update']
     active_override=cfg['vacation_enabled'] or cfg['night_enabled'] or cfg['sleep_until'] is not None
+    if not device_confirmed:
+        with lock:auto.update(reason='Device not confirmed; automatic writes disabled',desired_level=None)
+        return
     if not cfg['enabled'] and not active_override:
         with lock:auto.update(reason='Disabled',desired_level=None,humidity_active=False)
         return
@@ -174,6 +249,7 @@ def exchange(fc, address, quantity_or_words):
     else: pdu=struct.pack('>BHHB',16,address,len(quantity_or_words),len(quantity_or_words)*2)+struct.pack('>'+('H'*len(quantity_or_words)),*quantity_or_words)
     packet=struct.pack('>HHHB',tx,0,len(pdu)+1,a.unit)+pdu
     with bus_lock:
+        if a.device=='auto':raise ConnectionError('No device selected; use Scan Network')
         with socket.create_connection((a.device,a.port),timeout=4) as s:
             s.settimeout(4);s.sendall(packet)
             def recv(n):
@@ -221,7 +297,7 @@ def poll():
         time.sleep(max(10,a.interval))
 
 HTML=r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AirNest · Your Home · HCV 400</title><style>
-:root{color-scheme:dark;--bg:#08111d;--card:#111f30;--line:#273a50;--text:#f1f7fb;--muted:#a4b5c8;--mint:#65e3bd;--blue:#66baff;--orange:#ffb36c}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 70% 0%,#1b3048 0%,var(--bg) 55%);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:1160px;margin:auto;padding:26px 20px 70px}header{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:22px}.brand{display:flex;align-items:center;gap:13px}.logo{width:53px;height:53px;border-radius:16px;background:linear-gradient(145deg,#183d52,#174d4b);display:grid;place-items:center;border:1px solid #4d8e9d}.logo svg{width:34px}h1{font-size:25px;margin:0;letter-spacing:-.6px}h2{font-size:18px;margin:0 0 13px}h3{font-size:15px;margin:0 0 8px}.muted,small{color:var(--muted)}.pill{padding:7px 12px;border-radius:40px;border:1px solid #3d6171;color:#b8e8e1;background:#142d36;font-size:13px}.hero{display:grid;grid-template-columns:1.65fr 1fr;gap:17px}.card{background:linear-gradient(155deg,#15263a,#101b2a);border:1px solid var(--line);border-radius:19px;padding:21px;box-shadow:0 12px 35px #0002}.visual{position:relative;overflow:hidden;padding:0}.visual img{width:100%;display:block;aspect-ratio:1.56;object-fit:cover}.visual .overlay{padding:13px 20px;background:#101c2be8;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#66db9c;margin-right:7px}.statgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.stat{background:#0b1929;border:1px solid #294057;border-radius:13px;padding:13px}.stat strong{font-size:25px;display:block;margin-top:3px;font-variant-numeric:tabular-nums}.section{margin-top:20px}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:17px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.space{justify-content:space-between}button,input,select{font:inherit}button{border:1px solid #41647a;background:#21374b;color:#f2f7fc;padding:10px 14px;border-radius:11px;cursor:pointer}button:hover{border-color:var(--mint)}button:disabled{opacity:.55;cursor:not-allowed}.primary{background:#176951;border-color:#2a9774}.active{background:#176951;border-color:#7bf4cd}.danger{background:#57303a;border-color:#995b69}input[type=time],input[type=number],select{background:#0c1a2b;border:1px solid #40566b;color:white;padding:9px;border-radius:9px;max-width:160px}input[type=checkbox]{accent-color:#5bdfb6;width:17px;height:17px}.field{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:12px 0}.field label{color:#c8d5e0}.speed{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:15px 0}.speed button{padding:15px 5px}.speed b{font-size:22px;display:block}.modegrid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.modegrid button{text-align:left;min-height:78px}.modegrid b{display:block}.modegrid small{display:block}.schedule-row{display:flex;align-items:center;gap:9px;margin:8px 0}.schedule-row button{padding:8px}.divider{height:1px;background:var(--line);margin:20px 0}.notice{border-left:3px solid var(--orange);padding:8px 12px;background:#4033214a;color:#f7d7a9;font-size:13px;border-radius:4px}#message,#auto_status,#filter_status{font-size:13px;min-height:22px;color:#9fe9d2}.measurements{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.measurements .stat strong{font-size:21px}.tag{color:var(--mint);font-size:12px}.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px}.legend span:before{content:'?';margin-right:5px}.blue:before{color:#66baff}.teal:before{color:#4de3c9}.orange:before{color:#ffb36c}.gray:before{color:#b1c4d4}@media(max-width:800px){.hero,.twocol{grid-template-columns:1fr}.measurements{grid-template-columns:repeat(2,1fr)}}@media(max-width:450px){.speed{grid-template-columns:repeat(2,1fr)}.modegrid{grid-template-columns:1fr}.wrap{padding:14px}.card{padding:15px}}
+:root{color-scheme:dark;--bg:#08111d;--card:#111f30;--line:#273a50;--text:#f1f7fb;--muted:#a4b5c8;--mint:#65e3bd;--blue:#66baff;--orange:#ffb36c}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 70% 0%,#1b3048 0%,var(--bg) 55%);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:1160px;margin:auto;padding:26px 20px 70px}header{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:22px}.brand{display:flex;align-items:center;gap:13px}.logo{width:53px;height:53px;border-radius:16px;background:linear-gradient(145deg,#183d52,#174d4b);display:grid;place-items:center;border:1px solid #4d8e9d}.logo svg{width:34px}h1{font-size:25px;margin:0;letter-spacing:-.6px}h2{font-size:18px;margin:0 0 13px}h3{font-size:15px;margin:0 0 8px}.muted,small{color:var(--muted)}.pill{padding:7px 12px;border-radius:40px;border:1px solid #3d6171;color:#b8e8e1;background:#142d36;font-size:13px}.hero{display:grid;grid-template-columns:1.65fr 1fr;gap:17px}.card{background:linear-gradient(155deg,#15263a,#101b2a);border:1px solid var(--line);border-radius:19px;padding:21px;box-shadow:0 12px 35px #0002}.visual{position:relative;overflow:hidden;padding:0}.visual img{width:100%;display:block;aspect-ratio:1.56;object-fit:cover}.visual .overlay{padding:13px 20px;background:#101c2be8;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#66db9c;margin-right:7px}.statgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.stat{background:#0b1929;border:1px solid #294057;border-radius:13px;padding:13px}.stat strong{font-size:25px;display:block;margin-top:3px;font-variant-numeric:tabular-nums}.section{margin-top:20px}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:17px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.space{justify-content:space-between}button,input,select{font:inherit}button{border:1px solid #41647a;background:#21374b;color:#f2f7fc;padding:10px 14px;border-radius:11px;cursor:pointer}button:hover{border-color:var(--mint)}button:disabled{opacity:.55;cursor:not-allowed}.primary{background:#176951;border-color:#2a9774}.active{background:#176951;border-color:#7bf4cd}.danger{background:#57303a;border-color:#995b69}input[type=time],input[type=number],select{background:#0c1a2b;border:1px solid #40566b;color:white;padding:9px;border-radius:9px;max-width:160px}input[type=checkbox]{accent-color:#5bdfb6;width:17px;height:17px}.field{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:12px 0}.field label{color:#c8d5e0}.speed{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:15px 0}.speed button{padding:15px 5px}.speed b{font-size:22px;display:block}.modegrid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.modegrid button{text-align:left;min-height:78px}.modegrid b{display:block}.modegrid small{display:block}.schedule-row{display:flex;align-items:center;gap:9px;margin:8px 0}.schedule-row button{padding:8px}.divider{height:1px;background:var(--line);margin:20px 0}.notice{border-left:3px solid var(--orange);padding:8px 12px;background:#4033214a;color:#f7d7a9;font-size:13px;border-radius:4px}#message,#auto_status,#filter_status{font-size:13px;min-height:22px;color:#9fe9d2}.measurements{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.measurements .stat strong{font-size:21px}.tag{color:var(--mint);font-size:12px}.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px}.legend span:before{content:'●';margin-right:5px}.blue:before{color:#66baff}.teal:before{color:#4de3c9}.orange:before{color:#ffb36c}.gray:before{color:#b1c4d4}@media(max-width:800px){.hero,.twocol{grid-template-columns:1fr}.measurements{grid-template-columns:repeat(2,1fr)}}@media(max-width:450px){.speed{grid-template-columns:repeat(2,1fr)}.modegrid{grid-template-columns:1fr}.wrap{padding:14px}.card{padding:15px}}
 
 /* AirNest v6 — house-specific design */
 :root{--bg:#061321;--card:#0b2233;--line:#20516b;--mint:#34e5b2;--blue:#3ab9ff;--orange:#ffae51}
@@ -237,8 +313,8 @@ button{transition:background .15s,border-color .15s,transform .15s}
 button:hover:not(:disabled){transform:translateY(-1px)}
 @media(max-width:800px){.hero{grid-template-columns:1fr}.visual img{aspect-ratio:auto}.wrap{padding:12px 12px 40px}header{padding:12px}}
 </style></head><body><div class="wrap"><header><div class="brand"><div class="logo"><svg viewBox="0 0 64 64" fill="none"><path d="M8 30 32 10 56 30v23H8V30Z" stroke="#83f0cf" stroke-width="4" stroke-linejoin="round"/><path d="M14 37h36M32 23v25" stroke="#83f0cf" stroke-width="3"/><path d="m20 39 8-5-8-5M44 35l-8 5 8 5" stroke="#78caff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><h1>AirNest <span class="muted">/ HCV 400</span></h1><small>Your home · local ventilation monitoring & control</small></div></div><div class="pill" id="connection"><span class="dot"></span>Connecting to 192.168.1.142</div></header>
-<div class="hero"><section class="card visual"><img src="/house_airflow.png" alt="Airflow visualization inspired by your house: outdoor intake blue, indoor extract orange, supply teal, exhaust grey"><div class="overlay"><b>Your home · Airflow overview</b><div class="legend"><span class="blue">Blue · intake</span><span class="teal">Teal · bedroom/living supply</span><span class="orange">Orange · stairs/kitchen extract</span><span class="gray">Grey · exhaust outdoors</span></div></div></section><section class="card"><h2>Home climate</h2><div class="statgrid"><div class="stat"><small>Outdoor</small><strong id="outdoor">—</strong></div><div class="stat"><small>Supply</small><strong id="supplytemp">—</strong></div><div class="stat"><small>Indoor extract</small><strong id="extracttemp">—</strong></div><div class="stat"><small>Humidity</small><strong id="humidity">—</strong></div></div><div class="divider"></div><div class="row space"><span>Current fan</span><b id="currentfan">—</b></div><div class="row space"><span>Supply / extract RPM</span><b id="rpms">—</b></div><div class="row space"><span>Filter remaining</span><b id="filterdays">—</b></div><small id="lastupdate">Waiting for device…</small></section></div>
-<div class="twocol section"><section class="card"><h2>Fan speed</h2><div class="speed" id="speeds"><button data-level="1"><b>1</b>Quiet</button><button data-level="2"><b>2</b>Normal</button><button data-level="3"><b>3</b>High</button><button data-level="4"><b>4</b>Boost</button></div><div class="field"><input type="checkbox" id="manual_confirm"><label for="manual_confirm">Allow manual fan changes</label></div><div id="message" role="status"></div><small>Fan writes use community register 324. Verify changes with the official Dantherm controller. Manual commands can be overridden by active automations.</small></section><section class="card"><h2>Quick modes</h2><div class="modegrid"><button id="sleep"><b>? Sleep</b><small id="sleep_label">Fan 1 for 8 hours</small></button><button id="vacation"><b>? Vacation</b><small>Keep fan at 1 until disabled</small></button></div><div class="field"><label>Sleep duration</label><select id="sleep_hours"><option value="2">2 hours</option><option value="4">4 hours</option><option value="8" selected>8 hours</option><option value="12">12 hours</option></select></div><div class="notice">These are app-managed fan overrides, not the unit's built-in Sleep/Away modes. The PC must stay on.</div></section></div>
+<section class="card section"><h2>Network & device discovery</h2><p>Find your HCV 400 after changing Wi-Fi, router or IP address. Discovery scans your current local /24 IPv4 network, and never changes device settings.</p><div class="row"><button id="scan_network">Scan Network</button><select id="device_list"><option value="">No devices scanned</option></select><button id="select_device">Use selected device</button></div><small id="scan_status">A newly discovered device must be confirmed before fan or automation commands are enabled.</small></section><div class="hero"><section class="card visual"><img src="/house_airflow.png" alt="Airflow visualization inspired by your house: outdoor intake blue, indoor extract orange, supply teal, exhaust grey"><div class="overlay"><b>Your home · Airflow overview</b><div class="legend"><span class="blue">Blue · intake</span><span class="teal">Teal · bedroom/living supply</span><span class="orange">Orange · stairs/kitchen extract</span><span class="gray">Grey · exhaust outdoors</span></div></div></section><section class="card"><h2>Home climate</h2><div class="statgrid"><div class="stat"><small>Outdoor</small><strong id="outdoor">—</strong></div><div class="stat"><small>Supply</small><strong id="supplytemp">—</strong></div><div class="stat"><small>Indoor extract</small><strong id="extracttemp">—</strong></div><div class="stat"><small>Humidity</small><strong id="humidity">—</strong></div></div><div class="divider"></div><div class="row space"><span>Current fan</span><b id="currentfan">—</b></div><div class="row space"><span>Supply / extract RPM</span><b id="rpms">—</b></div><div class="row space"><span>Filter remaining</span><b id="filterdays">—</b></div><small id="lastupdate">Waiting for device…</small></section></div>
+<div class="twocol section"><section class="card"><h2>Fan speed</h2><div class="speed" id="speeds"><button data-level="1"><b>1</b>Quiet</button><button data-level="2"><b>2</b>Normal</button><button data-level="3"><b>3</b>High</button><button data-level="4"><b>4</b>Boost</button></div><div class="field"><input type="checkbox" id="manual_confirm"><label for="manual_confirm">Allow manual fan changes</label></div><div id="message" role="status"></div><small>Fan writes use community register 324. Verify changes with the official Dantherm controller. Manual commands can be overridden by active automations.</small></section><section class="card"><h2>Quick modes</h2><div class="modegrid"><button id="sleep"><b>☾ Sleep</b><small id="sleep_label">Fan 1 for 8 hours</small></button><button id="vacation"><b>✈ Vacation</b><small>Keep fan at 1 until disabled</small></button></div><div class="field"><label>Sleep duration</label><select id="sleep_hours"><option value="2">2 hours</option><option value="4">4 hours</option><option value="8" selected>8 hours</option><option value="12">12 hours</option></select></div><div class="notice">These are app-managed fan overrides, not the unit's built-in Sleep/Away modes. The PC must stay on.</div></section></div>
 <div class="twocol section"><section class="card"><h2>Schedule & night mode</h2><div class="field"><input type="checkbox" id="auto_enabled"><label>Enable daily schedule</label></div><div id="schedule_rows"></div><button id="add_row">+ Add time</button><div class="divider"></div><div class="field"><input type="checkbox" id="night_enabled"><label>Night mode · force fan level 1</label></div><div class="field"><label>From</label><input type="time" id="night_start"><label>until</label><input type="time" id="night_end"></div><small>Night interval works across midnight and takes priority over the daily schedule.</small></section><section class="card"><h2>Humidity automation</h2><div class="field"><input type="checkbox" id="hum_enabled"><label>Reduce to fan 1 when air is dry</label></div><div class="field"><label>Below</label><input type="number" id="hum_below" min="20" max="75"><span>%</span><label>Resume at</label><input type="number" id="hum_release" min="22" max="85"><span>%</span></div><small>Humidity override requires the daily schedule to be enabled. Night, vacation and sleep overrides have higher priority.</small><div class="divider"></div><button class="primary" id="save_auto">Save settings</button><p id="auto_status" role="status"></p><div class="notice">Automation starts disabled by default. These local controls cannot replace minimum ventilation requirements or the unit's safety protections.</div></section></div>
 <section class="card section"><h2>Filter maintenance</h2><div class="row space"><span>Filter time remaining</span><b id="filter_remaining">—</b></div><div class="row space"><span>Current filter period</span><b id="filter_period">—</b></div><div class="field"><label for="period_days">Change filter reminder period</label><select id="period_days"><option value="90">90 days</option><option value="180" selected>180 days</option><option value="270">270 days</option><option value="365">365 days</option></select><button id="set_period">Apply to unit</button></div><div class="field"><button id="filter_reset" disabled>Reset filter timer · not yet enabled</button></div><div id="filter_status" role="status"></div><small>Filter-period writes use community register 556 with readback verification. The filter reset register 558 is documented but the reset command value is not verified, so remote reset is disabled. After inspecting/replacing filters, use the official Dantherm control panel to reset the timer.</small></section>
 <section class="card section"><h2>More device readings</h2><div class="measurements" id="measurements"></div><p><a style="color:var(--mint)" href="/api/readings">Open JSON readings API</a></p><small>Values may depend on installed sensors. This dashboard does not alter factory safety settings.</small></section></div>
@@ -254,8 +330,10 @@ $('add_row').onclick=()=>row();$('save_auto').onclick=async()=>{try{if(!cfg)thro
 async function quick(kind){if(!cfg)return;try{let c=collect();if(kind==='vacation'){c.vacation_enabled=!cfg.vacation_enabled;if(c.vacation_enabled&&!confirm('Vacation mode will hold fan level 1 until you turn it off. Continue?'))return}if(kind==='sleep'){const active=cfg.sleep_until&&Date.parse(cfg.sleep_until)>Date.now();c.sleep_until=active?null:new Date(Date.now()+Number($('sleep_hours').value)*3600000).toISOString();if(!active&&!confirm('Start sleep mode at fan level 1?'))return}await saveConfig(c);show('auto_status','Mode saved.');await refresh()}catch(e){show('auto_status',e.message)}}$('sleep').onclick=()=>quick('sleep');$('vacation').onclick=()=>quick('vacation');
 for(const b of document.querySelectorAll('[data-level]'))b.onclick=async()=>{if(busy)return;if(!$('manual_confirm').checked){show('message','First check “Allow manual fan changes”.');return}if(!confirm('Set fan to level '+b.dataset.level+'?'))return;busy=true;document.querySelectorAll('[data-level]').forEach(x=>x.disabled=true);try{const j=await api('/api/fan',{method:'POST',headers:{'Content-Type':'application/json','X-Local-Token':token},body:JSON.stringify({level:Number(b.dataset.level)})});show('message',j.message||'Command sent');await refresh()}catch(e){show('message','Fan command error: '+e.message+' — check if the server is still running.')}finally{busy=false;document.querySelectorAll('[data-level]').forEach(x=>x.disabled=false)}};
 $('set_period').onclick=async()=>{const days=Number($('period_days').value);if(!confirm('Change the device filter reminder interval to '+days+' days? This writes register 556.'))return;try{const j=await api('/api/filter-period',{method:'POST',headers:{'Content-Type':'application/json','X-Local-Token':token},body:JSON.stringify({days,confirm:'CHANGE FILTER PERIOD'})});show('filter_status',j.message);await refresh()}catch(e){show('filter_status','Period change failed: '+e.message)}};
-const labels={exhaust_temp:'Exhaust temperature',bypass:'Bypass status (raw)',operation_mode:'Operation mode (raw)',alarm_status:'Alarm status (raw)',runtime_hours:'Runtime',preheater_duty:'Preheater duty (raw)',air_quality:'Air quality (raw)',co2:'CO2 (optional)',filter_period:'Filter period',supply_rpm:'Supply fan',extract_rpm:'Extract fan'};
-async function refresh(){try{const [s,a]=await Promise.all([api('/api/readings'),api('/api/automation')]);token=s.token;renderConfig(a.config);cfg=a.config;show('connection',s.status+' · '+s.device+':502');const v=s.values||{};const val=k=>v[k]?.value;for(const [id,k,unit] of [['outdoor','outdoor_temp','°C'],['supplytemp','supply_temp','°C'],['extracttemp','extract_temp','°C'],['humidity','humidity','%']])show(id,val(k)??'—'+unit);show('currentfan',val('fan_level')??'—');show('rpms',(val('supply_rpm')??'—')+' / '+(val('extract_rpm')??'—'));show('filterdays',(val('filter_days')??'—')+' days');show('filter_remaining',(val('filter_days')??'—')+' days');show('filter_period',(val('filter_period')??'—')+' days');show('lastupdate','Last update: '+(s.last_update||'waiting')+' · Errors: '+Object.keys(s.errors||{}).length);document.querySelectorAll('[data-level]').forEach(b=>b.classList.toggle('active',Number(b.dataset.level)===val('fan_level')));$('vacation').classList.toggle('active',cfg.vacation_enabled);const sleepActive=cfg.sleep_until&&Date.parse(cfg.sleep_until)>Date.now();$('sleep').classList.toggle('active',!!sleepActive);show('sleep_label',sleepActive?'Active until '+new Date(cfg.sleep_until).toLocaleTimeString():'Fan 1 for selected hours');show('auto_status','Automation: '+a.status.reason+(a.status.last_error?' · '+a.status.last_error:''));$('measurements').innerHTML=Object.entries(labels).map(([k,l])=>'<div class="stat"><small>'+l+'</small><strong>'+((val(k)??'—'))+'</strong><small>Register '+(v[k]?.address??'—')+'</small></div>').join('')}catch(e){show('connection','Disconnected · '+e.message)}}
+const labels={exhaust_temp:'Exhaust temperature',bypass:'Bypass status (raw)',operation_mode:'Operation mode (raw)',alarm_status:'Alarm status (raw)',runtime_hours:'Runtime',preheater_duty:'Preheater duty (raw)',air_quality:'Air quality (raw)',co2:'CO₂ (optional)',filter_period:'Filter period',supply_rpm:'Supply fan',extract_rpm:'Extract fan'};
+$('scan_network').onclick=async()=>{try{const j=await api('/api/discovery',{method:'POST',headers:{'Content-Type':'application/json','X-Local-Token':token},body:'{}'});show('scan_status',j.message); }catch(e){show('scan_status',e.message)}};
+$('select_device').onclick=async()=>{const ip=$('device_list').value;if(!ip)return; if(!confirm('Connect to '+ip+'? Automatic fan control will be disabled until re-enabled. Confirm this is your Dantherm device.'))return;try{const j=await api('/api/device',{method:'POST',headers:{'Content-Type':'application/json','X-Local-Token':token},body:JSON.stringify({ip})});show('scan_status',j.message);await refresh()}catch(e){show('scan_status',e.message)}};
+async function refresh(){try{const [s,a]=await Promise.all([api('/api/readings'),api('/api/automation')]);token=s.token;renderConfig(a.config);cfg=a.config;show('connection',s.status+' · '+s.device+':502'+(s.device_confirmed?'':' · controls locked'));const d=await api('/api/discovery');if(d.running)show('scan_status','Scanning local network…');else if(d.error)show('scan_status',d.error);else if(d.last_scan)show('scan_status',d.candidates.length+' compatible response(s) found. Select your device to enable controls.');const sel=$('device_list');const old=sel.value;sel.innerHTML='<option value="">Choose device</option>'+d.candidates.map(x=>'<option value="'+x.ip+'">'+x.ip+' (identity unverified)</option>').join('');sel.value=old;const v=s.values||{};const val=k=>v[k]?.value;for(const [id,k,unit] of [['outdoor','outdoor_temp','°C'],['supplytemp','supply_temp','°C'],['extracttemp','extract_temp','°C'],['humidity','humidity','%']])show(id,val(k)??'—'+unit);show('currentfan',val('fan_level')??'—');show('rpms',(val('supply_rpm')??'—')+' / '+(val('extract_rpm')??'—'));show('filterdays',(val('filter_days')??'—')+' days');show('filter_remaining',(val('filter_days')??'—')+' days');show('filter_period',(val('filter_period')??'—')+' days');show('lastupdate','Last update: '+(s.last_update||'waiting')+' · Errors: '+Object.keys(s.errors||{}).length);document.querySelectorAll('[data-level]').forEach(b=>b.classList.toggle('active',Number(b.dataset.level)===val('fan_level')));$('vacation').classList.toggle('active',cfg.vacation_enabled);const sleepActive=cfg.sleep_until&&Date.parse(cfg.sleep_until)>Date.now();$('sleep').classList.toggle('active',!!sleepActive);show('sleep_label',sleepActive?'Active until '+new Date(cfg.sleep_until).toLocaleTimeString():'Fan 1 for selected hours');show('auto_status','Automation: '+a.status.reason+(a.status.last_error?' · '+a.status.last_error:''));$('measurements').innerHTML=Object.entries(labels).map(([k,l])=>'<div class="stat"><small>'+l+'</small><strong>'+((val(k)??'—'))+'</strong><small>Register '+(v[k]?.address??'—')+'</small></div>').join('')}catch(e){show('connection','Disconnected · '+e.message)}}
 refresh();setInterval(refresh,6000);
 </script></body></html>
 '''
@@ -263,11 +341,13 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self,code,obj):
         body=json.dumps(obj).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
     def do_GET(self):
+        if urlsplit(self.path).path=='/api/discovery':
+            with lock:return self.send_json(200,dict(discovery))
         if urlsplit(self.path).path=='/api/health':
             with lock:
                 return self.send_json(200,{'server':'running','device_status':state['status'],'last_update':state['last_update'],'log_path':LOG_PATH,'last_command':state['last_command']})
         if urlsplit(self.path).path=='/api/readings':
-            with lock:payload=dict(state);payload['values']=dict(state['values']);payload['errors']=dict(state['errors']);payload['token']=csrf
+            with lock:payload=dict(state);payload['values']=dict(state['values']);payload['errors']=dict(state['errors']);payload['token']=csrf;payload['device_confirmed']=device_confirmed
             return self.send_json(200,payload)
         if urlsplit(self.path).path=='/api/automation':
             with lock:payload={'config':{**config,'schedule':[dict(x) for x in config['schedule']]},'status':dict(auto)}
@@ -285,13 +365,22 @@ class Handler(BaseHTTPRequestHandler):
             b=HTML.encode();self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         self.send_error(404)
     def do_POST(self):
-        if self.path not in ('/api/fan','/api/automation','/api/filter-period'):return self.send_json(404,{'error':'Not found'})
+        if self.path not in ('/api/fan','/api/automation','/api/filter-period','/api/discovery','/api/device'):return self.send_json(404,{'error':'Not found'})
         if self.headers.get('X-Local-Token')!=csrf:return self.send_json(403,{'error':'Invalid local token'})
         if self.headers.get('Content-Type','').split(';')[0]!='application/json':return self.send_json(415,{'error':'JSON required'})
         try:
             n=int(self.headers.get('Content-Length','0'))
             if n<1 or n>8192:raise ValueError('Invalid body length')
             data=json.loads(self.rfile.read(n))
+            if self.path=='/api/discovery':
+                with lock:
+                    if discovery['running']:return self.send_json(200,{'message':'Scan already running'})
+                    discovery['running']=True
+                threading.Thread(target=scan_worker,daemon=True).start()
+                return self.send_json(200,{'message':'Network scan started; results appear shortly'})
+            if self.path=='/api/device':
+                select_device(data.get('ip'))
+                return self.send_json(200,{'message':'Device selected; automation disabled until you enable it again'})
             if self.path=='/api/automation':
                 new=validate_config(data)
                 with lock:
@@ -301,6 +390,7 @@ class Handler(BaseHTTPRequestHandler):
                     auto['last_attempt_monotonic']=time.monotonic() if new['enabled'] else 0
                 return self.send_json(200,{'message':'Automation saved','config':new})
             if self.path=='/api/filter-period':
+                if not device_confirmed:raise ValueError('Confirm the device in Network Settings first')
                 days=data.get('days')
                 if type(days)!=int or not 90<=days<=365:raise ValueError('Filter period must be 90–365 days')
                 if data.get('confirm')!='CHANGE FILTER PERIOD':raise ValueError('Confirmation required')
@@ -329,6 +419,7 @@ class Handler(BaseHTTPRequestHandler):
             raise
 if __name__=='__main__':
     threading.Thread(target=poll,daemon=True).start()
+    threading.Thread(target=scan_worker,daemon=True).start()
     threading.Thread(target=automation_loop,daemon=True).start()
     print('Dashboard: http://localhost:'+str(a.web_port))
     logging.info('Starting AirNest on 127.0.0.1:%s, device %s:%s',a.web_port,a.device,a.port)
