@@ -115,3 +115,5 @@ AirNest is an independent, community-developed project and is not affiliated wit
 Some device-control functions rely on community-documented Modbus register mappings and have not been validated across all firmware versions.
 
 Users should verify compatibility before enabling write operations or automation. The dashboard does not replace manufacturer safety controls, recommended ventilation requirements, or regular equipment
+
+![AirNest Dashboard](house_airflow.png)
